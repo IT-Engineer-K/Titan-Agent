@@ -30,3 +30,15 @@ Titans（*Learning to Memorize at Test Time*, arXiv:2501.00663）の長期記憶
 1. [Kaggle Notebooks](https://www.kaggle.com/code) で新規ノートブックを作成し、`exp1_curriculum_rl/exp1_titans_curriculum_rl.ipynb` をインポートします。
 2. Settings で **Accelerator = GPU T4 x2（または P100）**、**Internet = On** に設定します。
 3. デフォルト（`PRESET = 'tiny'`, `SFT_STEPS = 800`, `GRPO_STEPS = 120`, `GROUP_SIZE = 4`）のまま上から順に実行すると、Stage 1（SFT）→ 評価 → Stage 2（GRPO）→ 比較評価まで一括で回ります。
+
+## 実験2: 小型 Titans (MAC) による思考整理・壁打ち学習（SFT → GRPO）
+
+「不足前提を見抜く逆質問（Level 1）→ 複数前提の多段深掘り（Level 2）→ 過去の前提を聞き直さない長期記憶の壁打ち（Level 3）」を検証する構成です。実験1.5の知見を踏まえ、段階報酬・Level 2/3 重点 GRPO・各レベル40問評価を組み込んでいます。
+
+- ノートブック: `exp2_thinking_partner/exp2_titans_thinking_partner.ipynb`
+- CLI スクリプト: `exp2_thinking_partner/train_thinking_partner.py`
+
+### Kaggle での実行手順
+1. [Kaggle Notebooks](https://www.kaggle.com/code) で新規ノートブックを作成し、`exp2_thinking_partner/exp2_titans_thinking_partner.ipynb` をインポートします。
+2. Settings で **Accelerator = GPU T4 x2（または P100）**、**Internet = On** に設定します。
+3. デフォルト（`PRESET = 'tiny'`, `SFT_STEPS = 450`, `GRPO_STEPS = 120`, `GROUP_SIZE = 4`, `EVAL_PER_LEVEL = 40`）のまま上から順に実行すると、Stage 1（SFT）→ 評価 → Stage 2（GRPO）→ 比較評価まで一括で回ります。
