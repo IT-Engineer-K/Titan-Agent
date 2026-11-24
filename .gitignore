@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+
+# Jupyter / Kaggle
+.ipynb_checkpoints/
+
+# Model checkpoints & large artifacts
+checkpoints/
+*.pt
+*.pth
+*.bin
+*.safetensors
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
