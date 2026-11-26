@@ -38,10 +38,12 @@ class TitansMemoryConfig:
     hidden_size: int = 896  # Qwen2.5-0.5B default; auto-inferred when loading HF model
     mem_dim: int = 256
     num_persist_mem_tokens: int = 4
-    num_longterm_mem_tokens: int = 8
-    max_grad_norm: float = 1.0
-    base_lr_scale: float = 0.15
+    num_longterm_mem_tokens: int = 16
+    max_grad_norm: float = 2.0
+    base_lr_scale: float = 0.5
     max_active_turns: int = 3
+    use_delta_readout: bool = True
+    use_hidden_memory: bool = True
 
 
 @dataclass
@@ -127,7 +129,7 @@ class TitansMACAdapter(nn.Module):
         self.gate_proj = nn.Linear(h, 3)
         nn.init.zeros_(self.gate_proj.weight)
         with torch.no_grad():
-            self.gate_proj.bias.copy_(torch.tensor([-3.0, 0.0, -1.0]))
+            self.gate_proj.bias.copy_(torch.tensor([-2.5, 0.5, 0.5]))
 
         # Learned initial fast weights M_0 (meta-learned initialization)
         self.w1_init = nn.Parameter(torch.empty(d, d))
@@ -146,8 +148,7 @@ class TitansMACAdapter(nn.Module):
         )
         self.out_norm = nn.LayerNorm(d)
         self.out_proj = nn.Linear(d, h, bias=False)
-        # Start with small residual scale so frozen LLM isn't disrupted early in training
-        self.out_scale = nn.Parameter(torch.tensor(0.1))
+        self.out_scale = nn.Parameter(torch.tensor(0.5))
 
     def init_state(self, batch_size: int, device: torch.device) -> TitansMemoryState:
         w1 = self.w1_init.float().unsqueeze(0).expand(batch_size, -1, -1).clone()
@@ -266,6 +267,11 @@ class TitansMACAdapter(nn.Module):
         )  # [B, M, D]
 
         retrieved, _, _, _ = self._memory_forward(queries, state.w1, state.w2)
+        if self.cfg.use_delta_readout:
+            w1_0 = self.w1_init.float().unsqueeze(0).expand(bsz, -1, -1)
+            w2_0 = self.w2_init.float().unsqueeze(0).expand(bsz, -1, -1)
+            base_ret, _, _, _ = self._memory_forward(queries, w1_0, w2_0)
+            retrieved = retrieved - base_ret
         retrieved = self.out_proj(self.out_norm(retrieved)) * self.out_scale  # [B, M, H]
 
         persist = self.persist_mem.float().expand(bsz, -1, -1)  # [B, P, H]
@@ -357,9 +363,56 @@ class TinyMockCausalLM(nn.Module):
         return type("Out", (), {"logits": logits})()
 
 
+class LoRALinear(nn.Module):
+    """Lightweight fp32-parameter LoRA wrapper for any nn.Linear (zero external deps)."""
+
+    def __init__(self, base: nn.Linear, r: int = 8, alpha: float = 16.0) -> None:
+        super().__init__()
+        self.base = base
+        for p in self.base.parameters():
+            p.requires_grad = False
+        self.r = r
+        self.alpha = alpha
+        self.scaling = alpha / float(r)
+        dev = base.weight.device
+        self.lora_A = nn.Parameter(torch.empty((r, base.in_features), dtype=torch.float32, device=dev))
+        self.lora_B = nn.Parameter(torch.zeros((base.out_features, r), dtype=torch.float32, device=dev))
+        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        base_out = self.base(x)
+        lora_out = F.linear(F.linear(x.float(), self.lora_A), self.lora_B) * self.scaling
+        return base_out + lora_out.to(dtype=base_out.dtype)
+
+
+def apply_lora_to_model(
+    model: nn.Module,
+    r: int = 8,
+    alpha: float = 16.0,
+    target_modules: tuple[str, ...] = ("q_proj", "k_proj", "v_proj", "o_proj"),
+) -> int:
+    """Replaces matching nn.Linear submodules with LoRALinear. Returns count of wrapped layers."""
+    if r <= 0:
+        return 0
+    replaced = 0
+    for name, module in list(model.named_modules()):
+        for child_name, child in list(module.named_children()):
+            if isinstance(child, nn.Linear) and child_name in target_modules:
+                setattr(module, child_name, LoRALinear(child, r=r, alpha=alpha))
+                replaced += 1
+    if replaced == 0:
+        # Fallback for TinyMockCausalLM (nn.TransformerEncoderLayer uses linear1/linear2)
+        for name, module in list(model.named_modules()):
+            for child_name, child in list(module.named_children()):
+                if isinstance(child, nn.Linear) and child_name in ("linear1", "linear2"):
+                    setattr(module, child_name, LoRALinear(child, r=r, alpha=alpha))
+                    replaced += 1
+    return replaced
+
+
 class TitansMACLLM(nn.Module):
     """
-    Wraps a frozen base CausalLM with a trainable TitansMACAdapter.
+    Wraps a frozen (or LoRA-augmented) base CausalLM with a trainable TitansMACAdapter.
     """
 
     def __init__(
@@ -367,14 +420,40 @@ class TitansMACLLM(nn.Module):
         base_model: nn.Module,
         mem_cfg: TitansMemoryConfig,
         freeze_base: bool = True,
+        use_memory: bool = True,
+        lora_r: int = 0,
+        lora_alpha: float = 16.0,
+        lora_targets: tuple[str, ...] = ("q_proj", "k_proj", "v_proj", "o_proj"),
     ) -> None:
         super().__init__()
         self.base_model = base_model
         if freeze_base:
             for p in self.base_model.parameters():
                 p.requires_grad = False
+        self.lora_r = lora_r
+        self.lora_alpha = lora_alpha
+        self.lora_layers_wrapped = 0
+        if lora_r > 0:
+            self.lora_layers_wrapped = apply_lora_to_model(
+                self.base_model, r=lora_r, alpha=lora_alpha, target_modules=lora_targets
+            )
+        self.use_memory = use_memory
         self.mem_cfg = mem_cfg
         self.adapter = TitansMACAdapter(mem_cfg)
+
+    def lora_parameters(self) -> list[nn.Parameter]:
+        return [
+            p
+            for n, p in self.base_model.named_parameters()
+            if p.requires_grad and ("lora_A" in n or "lora_B" in n)
+        ]
+
+    def lora_state_dict(self) -> dict[str, torch.Tensor]:
+        return {
+            k: v.detach().cpu()
+            for k, v in self.base_model.state_dict().items()
+            if "lora_A" in k or "lora_B" in k
+        }
 
     @property
     def prefix_len(self) -> int:
@@ -388,15 +467,52 @@ class TitansMACLLM(nn.Module):
         dev = device or next(self.adapter.parameters()).device
         return self.adapter.init_state(batch_size=batch_size, device=dev)
 
+    def encode_memory_segment(self, segment_ids: torch.Tensor) -> torch.Tensor:
+        """Extracts contextualized hidden states (or raw embeddings) for Titans memory write."""
+        with torch.no_grad():
+            if not self.mem_cfg.use_hidden_memory:
+                return self.embed_ids(segment_ids)
+            if hasattr(self.base_model, "model"):
+                out = self.base_model.model(input_ids=segment_ids, use_cache=False)
+                return out.last_hidden_state
+            # Fallback for TinyMockCausalLM
+            x = self.base_model.embed(segment_ids)
+            bsz, seq_len, _ = x.shape
+            pos = torch.arange(seq_len, device=x.device).unsqueeze(0).expand(bsz, -1)
+            x = x + self.base_model.pos_emb(pos.clamp(max=1023))
+            causal = torch.triu(
+                torch.ones(seq_len, seq_len, device=x.device, dtype=torch.bool), diagonal=1
+            )
+            return self.base_model.norm(self.base_model.encoder(x, mask=causal))
+
     def memorize_segment(
         self,
         segment_ids: torch.Tensor,
         state: TitansMemoryState,
         segment_mask: torch.Tensor | None = None,
     ) -> tuple[TitansMemoryState, dict[str, float]]:
-        with torch.no_grad():
-            seg_embeds = self.embed_ids(segment_ids)
-        return self.adapter.update_memory(seg_embeds, state, segment_mask=segment_mask)
+        if not self.use_memory:
+            return state, {"surprise": 0.0, "forget_rate": 0.0, "lr_theta": 0.0}
+        seg_repr = self.encode_memory_segment(segment_ids)
+        return self.adapter.update_memory(seg_repr, state, segment_mask=segment_mask)
+
+    def _get_prefix_embeds(
+        self,
+        prompt_embeds: torch.Tensor,
+        state: TitansMemoryState,
+    ) -> torch.Tensor:
+        if not self.use_memory:
+            bsz = prompt_embeds.shape[0]
+            persist = self.adapter.persist_mem.float().expand(bsz, -1, -1)
+            zeros = torch.zeros(
+                (bsz, self.mem_cfg.num_longterm_mem_tokens, self.mem_cfg.hidden_size),
+                dtype=torch.float32,
+                device=prompt_embeds.device,
+            )
+            return torch.cat([persist, zeros], dim=1).to(dtype=prompt_embeds.dtype)
+        return self.adapter.retrieve_prefix(
+            prompt_embeds, state, out_dtype=prompt_embeds.dtype
+        )
 
     def forward_with_memory(
         self,
@@ -404,29 +520,29 @@ class TitansMACLLM(nn.Module):
         target_ids: torch.Tensor,
         labels: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
+        loss_weights: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, TitansMemoryState, dict[str, float]]:
         """
         End-to-end differentiable forward pass:
           1. Streams each segment in `memory_segments` into Titans Neural Memory M_t.
           2. Retrieves MAC prefix conditioned on `target_ids`.
-          3. Runs frozen base LLM on [MAC_prefix, target_embeds] and computes CE loss on `labels`.
+          3. Runs base LLM on [MAC_prefix, target_embeds] and computes fp32 CE loss on `labels`.
         """
         bsz = target_ids.shape[0]
         device = target_ids.device
         state = self.init_memory_state(batch_size=bsz, device=device)
 
         last_stats = {"surprise": 0.0, "forget_rate": 0.0, "lr_theta": 0.0}
-        for seg_ids in memory_segments:
-            if seg_ids.shape[1] == 0:
-                continue
-            state, last_stats = self.memorize_segment(seg_ids, state)
+        if self.use_memory:
+            for seg_ids in memory_segments:
+                if seg_ids.shape[1] == 0:
+                    continue
+                state, last_stats = self.memorize_segment(seg_ids, state)
 
         with torch.no_grad():
             target_embeds = self.embed_ids(target_ids)
 
-        prefix_embeds = self.adapter.retrieve_prefix(
-            target_embeds, state, out_dtype=target_embeds.dtype
-        )
+        prefix_embeds = self._get_prefix_embeds(target_embeds, state)
         full_embeds = torch.cat([prefix_embeds, target_embeds], dim=1)
 
         if attention_mask is not None:
@@ -440,18 +556,27 @@ class TitansMACLLM(nn.Module):
         outputs = self.base_model(inputs_embeds=full_embeds, attention_mask=full_mask)
         logits = outputs.logits  # [B, prefix_len + T, V]
 
-        # Align logits with target tokens (ignore prefix positions)
-        target_logits = logits[:, self.prefix_len - 1 : -1, :]  # predicts target_ids[0..T-1]
         # Shift so position i predicts labels[i+1] matching standard CausalLM convention
-        shift_logits = logits[:, self.prefix_len : -1, :].contiguous()
+        shift_logits = logits[:, self.prefix_len : -1, :].float().contiguous()
         shift_labels = labels[:, 1:].contiguous()
 
-        loss = F.cross_entropy(
-            shift_logits.view(-1, shift_logits.size(-1)),
-            shift_labels.view(-1),
-            ignore_index=-100,
-        )
-        _ = target_logits
+        if loss_weights is not None:
+            per_tok = F.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+                ignore_index=-100,
+                reduction="none",
+            )
+            shift_w = loss_weights[:, 1:].contiguous().view(-1).float()
+            valid = (shift_labels.view(-1) != -100).float()
+            w = shift_w * valid
+            loss = (per_tok * w).sum() / w.sum().clamp_min(1.0)
+        else:
+            loss = F.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+                ignore_index=-100,
+            )
         return loss, state, last_stats
 
     @torch.no_grad()
@@ -472,14 +597,12 @@ class TitansMACLLM(nn.Module):
 
         prompt_tensor = torch.tensor([seq], dtype=torch.long, device=dev)
         prompt_embeds = self.embed_ids(prompt_tensor)
-        prefix_embeds = self.adapter.retrieve_prefix(
-            prompt_embeds, state, out_dtype=prompt_embeds.dtype
-        )
+        prefix_embeds = self._get_prefix_embeds(prompt_embeds, state)
         cur_embeds = torch.cat([prefix_embeds, prompt_embeds], dim=1)
 
         for _ in range(max_new_tokens):
             out = self.base_model(inputs_embeds=cur_embeds)
-            logits = out.logits[:, -1, :]
+            logits = out.logits[:, -1, :].float()
             if temperature <= 1e-5:
                 next_id = int(torch.argmax(logits, dim=-1).item())
             else:
@@ -512,6 +635,9 @@ class TitansMACLLM(nn.Module):
         payload = {
             "mem_cfg": asdict(self.mem_cfg),
             "adapter_state_dict": self.adapter.state_dict(),
+            "lora_r": self.lora_r,
+            "lora_alpha": self.lora_alpha,
+            "lora_state_dict": self.lora_state_dict(),
             "extra": extra or {},
         }
         torch.save(payload, path)
@@ -519,6 +645,9 @@ class TitansMACLLM(nn.Module):
     def load_adapter(self, path: str | Path, map_location: str | torch.device = "cpu") -> dict[str, Any]:
         payload = torch.load(path, map_location=map_location, weights_only=False)
         self.adapter.load_state_dict(payload["adapter_state_dict"])
+        lora_sd = payload.get("lora_state_dict")
+        if lora_sd:
+            self.base_model.load_state_dict(lora_sd, strict=False)
         return payload.get("extra", {})
 
 
