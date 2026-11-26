@@ -42,3 +42,15 @@ Titans（*Learning to Memorize at Test Time*, arXiv:2501.00663）の長期記憶
 1. [Kaggle Notebooks](https://www.kaggle.com/code) で新規ノートブックを作成し、`exp2_thinking_partner/exp2_titans_thinking_partner.ipynb` をインポートします。
 2. Settings で **Accelerator = GPU T4 x2（または P100）**、**Internet = On** に設定します。
 3. デフォルト（`PRESET = 'tiny'`, `SFT_STEPS = 450`, `GRPO_STEPS = 120`, `GROUP_SIZE = 4`, `EVAL_PER_LEVEL = 40`）のまま上から順に実行すると、Stage 1（SFT）→ 評価 → Stage 2（GRPO）→ 比較評価まで一括で回ります。
+
+## 実験2.5: 長距離記憶＆記憶上書きストレステスト
+
+- ノートブック: `exp2_5_memory_stress/exp2_5_titans_memory_stress.ipynb`
+- CLI スクリプト: `exp2_5_memory_stress/train_memory_stress.py`
+
+## 実験3 / 3.5: 毎トークン CoT 比較 ＆ フォーマット先行＋長さカリキュラム
+
+従来ターン型（`turn_cot`）・毎トークン残留型（`stream_token_cot`）・毎トークン揮発型（`ephemeral_token_cot`）の 3 方式を Titans (MAC) 上で比較検証した構成です。基礎実験フェーズのまとめは [docs/research_report_20261125.md](docs/research_report_20261125.md) を参照してください。
+
+- Exp 3: `exp3_per_token_cot/exp3_titans_per_token_cot.ipynb`, `exp3_per_token_cot/train_per_token_cot.py`
+- Exp 3.5: `exp3_5_length_curriculum/exp3_5_titans_length_curriculum.ipynb`, `exp3_5_length_curriculum/train_per_token_cot_v2.py`
